@@ -153,6 +153,7 @@ set(UI_FILES
 	CheatsView.ui
 	DebuggerConsole.ui
 	DolphinConnector.ui
+	NetLinkView.ui
 	FrameView.ui
 	GIFView.ui
 	IOViewer.ui
@@ -182,6 +183,7 @@ set(GBA_SRC
 	BattleChipUpdater.cpp
 	BattleChipView.cpp
 	DolphinConnector.cpp
+	NetLinkView.cpp
 	GBAOverride.cpp)
 
 set(GB_SRC

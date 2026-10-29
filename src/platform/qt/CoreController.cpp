@@ -128,6 +128,12 @@ CoreController::CoreController(mCore* core, QObject* parent)
 		controller->clearMultiplayerController();
 #ifdef M_CORE_GBA
 		controller->detachDolphin();
+		if (controller->m_netLinkAttached) {
+			GBASIONetLinkStop(&controller->m_netLink);
+			GBA* gba = static_cast<GBA*>(context->core->board);
+			GBASIOSetDriver(&gba->sio, nullptr, SIO_MULTI);
+			controller->m_netLinkAttached = false;
+		}
 #endif
 		QMetaObject::invokeMethod(controller, "stopping");
 	};
@@ -398,6 +404,71 @@ void CoreController::detachDolphin() {
 		GBASIOSetDriver(&gba->sio, nullptr, SIO_JOYBUS);
 	}
 	GBASIODolphinDestroy(&m_dolphin);
+}
+
+void CoreController::linkNudge(void* context) {
+	CoreController* controller = static_cast<CoreController*>(context);
+	mCoreSync* sync = &controller->m_threadContext.impl->sync;
+	mCoreSyncLockAudio(sync);
+	sync->audioWait = false;
+	ConditionWake(&sync->audioRequiredCond);
+	mCoreSyncUnlockAudio(sync);
+	mCoreSyncSetVideoSync(sync, false);
+}
+
+void CoreController::linkUnnudge(void* context) {
+	CoreController* controller = static_cast<CoreController*>(context);
+	controller->setSync(true);
+}
+
+static bool _attachNetLink(CoreController* controller, GBASIONetLink* link, bool& attached, mCoreThread* thread) {
+	if (controller->platform() != mPLATFORM_GBA) {
+		return false;
+	}
+	if (!attached) {
+		GBASIONetLinkCreate(link);
+		GBASIONetLinkSetNudge(link, CoreController::linkNudge, CoreController::linkUnnudge, controller);
+		GBASIONetLinkSetFast(link, controller->netLinkFast());
+		GBA* gba = static_cast<GBA*>(thread->core->board);
+		CoreController::Interrupter interrupter(controller);
+		GBASIOSetDriver(&gba->sio, &link->d, SIO_MULTI);
+		attached = true;
+	}
+	return true;
+}
+
+bool CoreController::hostNetLink(int port) {
+	if (!_attachNetLink(this, &m_netLink, m_netLinkAttached, &m_threadContext)) {
+		return false;
+	}
+	return GBASIONetLinkHost(&m_netLink, port);
+}
+
+bool CoreController::joinNetLink(const QString& address, int port) {
+	if (!_attachNetLink(this, &m_netLink, m_netLinkAttached, &m_threadContext)) {
+		return false;
+	}
+	return GBASIONetLinkJoin(&m_netLink, address.toUtf8().constData(), port);
+}
+
+void CoreController::setNetLinkFast(bool fast) {
+	m_netLinkFast = fast;
+	if (m_netLinkAttached) {
+		GBASIONetLinkSetFast(&m_netLink, fast);
+	}
+}
+
+void CoreController::detachNetLink() {
+	if (!m_netLinkAttached) {
+		return;
+	}
+	GBASIONetLinkStop(&m_netLink);
+	if (platform() == mPLATFORM_GBA && hasStarted()) {
+		GBA* gba = static_cast<GBA*>(m_threadContext.core->board);
+		Interrupter interrupter(this);
+		GBASIOSetDriver(&gba->sio, nullptr, SIO_MULTI);
+	}
+	m_netLinkAttached = false;
 }
 #endif
 

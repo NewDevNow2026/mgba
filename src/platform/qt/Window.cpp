@@ -33,6 +33,7 @@
 #include "DebuggerConsoleController.h"
 #include "Display.h"
 #include "DolphinConnector.h"
+#include "NetLinkView.h"
 #include "CoreController.h"
 #include "FrameView.h"
 #include "GBAApp.h"
@@ -1411,6 +1412,7 @@ void Window::setupMenu(QMenuBar* menubar) {
 #ifdef M_CORE_GBA
 	Action* dolphin = m_actions.addAction(tr("Connect to Dolphin..."), "connectDolphin", openNamedTView<DolphinConnector>(&m_dolphinView, this), "file");
 	m_platformActions.insert(mPLATFORM_GBA, dolphin);
+
 #endif
 
 	m_actions.addSeparator("file");
@@ -1486,6 +1488,11 @@ void Window::setupMenu(QMenuBar* menubar) {
 	}, "emu", QKeySequence("Ctrl+B"));
 	m_nonMpActions.append(frameRewind);
 
+	m_actions.addSeparator("emu");
+
+	m_actions.addSeparator("emu");
+	Action* netLink = m_actions.addAction(tr("Network link cable..."), "netLink", openNamedTView<NetLinkView>(&m_netLinkView, this), "emu");
+	m_platformActions.insert(mPLATFORM_GBA, netLink);
 	m_actions.addSeparator("emu");
 
 	m_actions.addMenu(tr("Solar sensor"), "solar", "emu");

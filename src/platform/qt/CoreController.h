@@ -27,6 +27,7 @@
 #endif
 #ifdef M_CORE_GBA
 #include <mgba/internal/gba/sio/dolphin.h>
+#include <mgba/internal/gba/sio/netlink.h>
 #endif
 
 #ifdef M_CORE_GBA
@@ -195,6 +196,15 @@ public slots:
 
 	bool attachDolphin(const Address& address);
 	void detachDolphin();
+
+	static void linkNudge(void* context);
+	static void linkUnnudge(void* context);
+	bool hostNetLink(int port);
+	bool joinNetLink(const QString& address, int port);
+	void detachNetLink();
+	void setNetLinkFast(bool fast);
+	bool netLinkFast() const { return m_netLinkFast; }
+	struct GBASIONetLink* netLink() { return m_netLinkAttached ? &m_netLink : nullptr; }
 #endif
 
 	void setAVStream(mAVStream*);
@@ -307,6 +317,9 @@ private:
 	MultiplayerController* m_multiplayer = nullptr;
 #ifdef M_CORE_GBA
 	GBASIODolphin m_dolphin;
+	struct GBASIONetLink m_netLink;
+	bool m_netLinkAttached = false;
+	bool m_netLinkFast = true;
 #endif
 
 	mVideoLogContext* m_vl = nullptr;

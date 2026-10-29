@@ -38,6 +38,9 @@ set(SOURCE_FILES
 set(SIO_FILES
 	sio/dolphin.c
 	sio/lockstep.c)
+if(UNIX)
+	list(APPEND SIO_FILES sio/netlink.c)
+endif()
 
 set(EXTRA_FILES
 	extra/audio-mixer.c

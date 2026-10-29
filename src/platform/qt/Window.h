@@ -36,6 +36,7 @@ class CoreManager;
 class DebuggerConsoleController;
 class Display;
 class DolphinConnector;
+class NetLinkView;
 class FrameView;
 class GDBController;
 class GIFView;
@@ -246,6 +247,7 @@ private:
 	std::unique_ptr<OverrideView> m_overrideView;
 	std::unique_ptr<SensorView> m_sensorView;
 	std::unique_ptr<DolphinConnector> m_dolphinView;
+	std::unique_ptr<NetLinkView> m_netLinkView;
 	FrameView* m_frameView = nullptr;
 
 #ifdef USE_FFMPEG
