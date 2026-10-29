@@ -1465,7 +1465,8 @@ static void _hostFrameBoundary(struct GBASIONetLink* link, struct mTiming* timin
 	}
 	case FAST_REAL:
 		if (link->realIndex != link->specCount) {
-			_hostAbortBlock(link, timing, "transfer count differs from speculation");
+			/* Normally handled (aligned) by _tick before we get here. */
+			link->abortFlag = true;
 			return;
 		}
 		if (_traceOn() && link->specHashValid) {
@@ -1772,6 +1773,12 @@ static void _tick(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 				_captureSpecEnd(link);
 			}
 		}
+		if (link->boundaryPending && link->fastPhase == FAST_REAL && link->realIndex != link->specCount && !link->abortFlag) {
+			/* The frame ended before the replay reached the predicted count: abort (aligned). */
+			NL_TRACE("M count mismatch at boundary: real=%d spec=%d", link->realIndex, link->specCount);
+			link->abortFlag = true;
+			link->boundaryPending = false; /* the restore takes us back before this boundary */
+		}
 		if (link->boundaryPending || link->abortFlag) {
 			bool needRestore = link->abortFlag || (link->boundaryPending && link->fastPhase == FAST_SPEC);
 			int32_t wait = (needRestore && link->snapshotValid) ? _restoreWait(timing, link->snapMaster) : 0;
@@ -1791,7 +1798,7 @@ static void _tick(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 					_hostFrameBoundary(link, timing);
 				}
 				if (link->abortFlag) {
-					_hostAbortBlock(link, timing, "word mismatch");
+					_hostAbortBlock(link, timing, link->fastPhase == FAST_REAL && link->realIndex != link->specCount ? "transfer count differs from speculation" : "word mismatch");
 				}
 				link->specFrozen = false;
 			}
