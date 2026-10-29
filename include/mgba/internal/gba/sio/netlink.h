@@ -119,10 +119,26 @@ struct GBASIONetLink {
 	size_t saveSnapshotSize;
 	uint32_t lastTickAt;
 	uint32_t snapCycles;
+	uint32_t snapMaster;       /* timing.masterCycles at the snapshot (alignment reference) */
 	uint32_t reportFrame;      /* frame number advertised to children (committed timeline only) */
+	/* Restores are deferred until (now - snapCycles) is a multiple of 1024 cycles, so prescaled
+	 * timers (which tick on absolute master-clock boundaries) keep their phase after the rebase. */
+	bool boundaryPending;
+	bool specFrozen;
+	bool childRestorePending;
+	uint32_t childRestoreSeq;
+	int restoreTries;
+	/* Child reply-gating state captured with the block snapshot. */
+	bool snapSendWritten;
+	bool snapHaveDone;
+	int32_t snapSinceDone;
 	uint32_t testAbortEvery;   /* debug: NETLINK_TEST_ABORT_EVERY forces an abort every N blocks */
 	uint32_t specHash[16];     /* debug: end-of-spec-frame fingerprint */
-	bool specHashValid;         /* SIOMLT_SEND is not part of the savestate */
+	bool specHashValid;
+	uint8_t* specIwram;        /* debug: IWRAM copy at spec end (NETLINK_TRACE) */
+	uint8_t* specIo;
+	int32_t specRel[24];
+	int specRelN;         /* SIOMLT_SEND is not part of the savestate */
 	uint32_t snapFrame;
 	uint16_t frozenKeys;
 	uint32_t lastFrameSeen;

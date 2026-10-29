@@ -11,6 +11,7 @@
 #include <mgba/internal/gba/video.h>
 #include <mgba/internal/gba/serialize.h>
 #include <mgba/internal/gba/audio.h>
+#include <mgba/core/blip_buf.h>
 #include <mgba/internal/gba/savedata.h>
 #include <mgba/internal/arm/macros.h>
 #include <stddef.h>
@@ -64,6 +65,29 @@ enum FastPhase {
 	FAST_REAL,   /* real frame running with the child's words known */
 };
 #define FAST_MAX_ABORTS 8
+#define RESTORE_ALIGN 1024 /* largest timer prescaler */
+
+#define RESTORE_MAX_TRIES 16
+
+
+/* Master-clock cycles to wait before a restore keeps the prescaler phase (0 =
+ * aligned now). Only timing->masterCycles counts: the CPU's pending cycles are
+ * part of the saved state and come back with it. */
+static int32_t _restoreWait(struct mTiming* timing, uint32_t snapMaster) {
+	return (int32_t) ((RESTORE_ALIGN - ((timing->masterCycles - snapMaster) & (RESTORE_ALIGN - 1))) & (RESTORE_ALIGN - 1));
+}
+
+/* Delay to pass to mTimingSchedule so the event lands exactly 'masterWait' master cycles from now. */
+static int32_t _scheduleDelay(struct mTiming* timing, int32_t masterWait) {
+	return masterWait - *timing->relativeCycles;
+}
+
+/* Regular ticks sit on absolute multiples of RESTORE_ALIGN, so the tick grid is
+ * the same in the speculative and the real pass whatever instruction overshoot
+ * the snapshot or restore tick had. */
+static int32_t _latticeWait(uint32_t now) {
+	return (int32_t) (RESTORE_ALIGN - (now & (RESTORE_ALIGN - 1)));
+}
 
 #define POLL_PERIOD 1024           /* cycles between queue checks (~61 us) */
 /* A child answers the next request once its game has serviced the serial IRQ
@@ -101,6 +125,35 @@ static bool _traceOn(void) {
 #else
 #define NL_TRACE(...) do { if (_traceOn()) { fprintf(stderr, "[nltrace %llu] ", (unsigned long long) (_nowNs() / 1000000ULL % 1000000ULL)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 #endif
+
+static uint64_t _nowNs(void);
+
+/* Debug aids (NETLINK_TRACE): watch one IWRAM word and dump the CPU at every tick of one frame. */
+static uint32_t s_watchOff = 0xFFFFFFFF;
+static uint32_t s_watchLast;
+static int64_t s_traceFrame = -1;
+static void _debugTick(struct GBASIONetLink* link, uint32_t nowCycles) {
+	if (!_traceOn()) {
+		return;
+	}
+	struct GBA* gba = link->sio->p;
+	if (s_watchOff == 0xFFFFFFFF) {
+		const char* w = getenv("NETLINK_WATCH");
+		s_watchOff = w ? (uint32_t) strtoul(w, NULL, 16) : 0xFFFFFFFE;
+		const char* f = getenv("NETLINK_TRACE_FRAME");
+		s_traceFrame = f ? atol(f) : -1;
+	}
+	if (s_watchOff < 0x8000) {
+		uint32_t v = *(uint32_t*) ((uint8_t*) gba->memory.iwram + s_watchOff);
+		if (v != s_watchLast) {
+			NL_TRACE("%c watch frame=%u cyc=%u val=%08x pc=%08x phase=%d", link->host ? 'M' : 'C', gba->video.frameCounter, nowCycles - link->snapCycles, v, gba->cpu->gprs[15], link->fastPhase);
+			s_watchLast = v;
+		}
+	}
+	if ((s_traceFrame >= 0 && gba->video.frameCounter == (uint32_t) s_traceFrame) || (s_traceFrame == -2 && link->fastPhase != FAST_IDLE)) {
+		NL_TRACE("%c tick cyc=%u pc=%08x vc=%d cycles=%d halt=%d phase=%d r0=%08x sp=%08x lr=%08x", link->host ? 'M' : 'C', nowCycles - link->snapCycles, gba->cpu->gprs[15], gba->video.vcount, gba->cpu->cycles, gba->cpu->halted, link->fastPhase, gba->cpu->gprs[0], gba->cpu->gprs[13], gba->cpu->gprs[14]);
+	}
+}
 
 static void _hostFrameBoundary(struct GBASIONetLink* link, struct mTiming* timing);
 static void _overrideKeys(struct GBASIONetLink* link, bool on);
@@ -703,6 +756,9 @@ void GBASIONetLinkStop(struct GBASIONetLink* link) {
 	link->curFrameCount = 0;
 	link->frameIdx = 0;
 	link->blockSent = false;
+	link->boundaryPending = false;
+	link->specFrozen = false;
+	link->childRestorePending = false;
 	if (link->sio) {
 		_overrideKeys(link, false);
 	}
@@ -846,7 +902,13 @@ struct NetLinkHash {
 	uint16_t siocnt, rcnt, send, m0, m1, keys;
 };
 
+static void _computeHashRel(struct GBASIONetLink* link, struct NetLinkHash* h, int32_t* relOut, int* relN);
+
 static void _computeHash(struct GBASIONetLink* link, struct NetLinkHash* h) {
+	_computeHashRel(link, h, NULL, NULL);
+}
+
+static void _computeHashRel(struct GBASIONetLink* link, struct NetLinkHash* h, int32_t* relOut, int* relN) {
 	struct GBA* gba = link->sio->p;
 	struct mTiming* t = &gba->timing;
 	uint32_t now = mTimingCurrentTime(t);
@@ -874,6 +936,10 @@ static void _computeHash(struct GBASIONetLink* link, struct NetLinkHash* h) {
 	rel[n++] = mTimingIsScheduled(t, &gba->memory.savedata.dust) ? (int32_t) (gba->memory.savedata.dust.when - now) : 0x7fffffff;
 	rel[n++] = gba->video.vcount | (gba->cpu->halted << 16) | (gba->cpuBlocked << 17) | (gba->memory.savedata.flashState << 18) | (gba->memory.savedata.command << 20);
 	h->tim = _fnv(2166136261u, rel, n * sizeof(int32_t));
+	if (relOut) {
+		memcpy(relOut, rel, n * sizeof(int32_t));
+		*relN = n;
+	}
 	struct GBASavedata* sd = &gba->memory.savedata;
 	if (sd->data) {
 		size_t size = GBASavedataSize(sd);
@@ -892,8 +958,10 @@ static void _computeHash(struct GBASIONetLink* link, struct NetLinkHash* h) {
 }
 
 static void _printHash(struct GBASIONetLink* link, const char* tag, const struct NetLinkHash* h) {
-	NL_TRACE("%c %s frame=%u pc=%08x iw=%08x w=%08x io=%08x cpu=%08x tim=%08x save=%08x pal=%08x siocnt=%04x rcnt=%04x send=%04x m0=%04x m1=%04x keys=%04x",
-	         link->host ? 'M' : 'C', tag, h->frame, h->pc, h->iw, h->w, h->io, h->cpu, h->tim, h->save, h->pal, h->siocnt, h->rcnt, h->send, h->m0, h->m1, h->keys);
+	struct GBA* gba = link->sio->p;
+	NL_TRACE("%c %s frame=%u pc=%08x iw=%08x w=%08x io=%08x cpu=%08x tim=%08x save=%08x pal=%08x siocnt=%04x rcnt=%04x send=%04x m0=%04x m1=%04x keys=%04x mc=%u ccyc=%d nev=%d halt=%d vc=%d",
+	         link->host ? 'M' : 'C', tag, h->frame, h->pc, h->iw, h->w, h->io, h->cpu, h->tim, h->save, h->pal, h->siocnt, h->rcnt, h->send, h->m0, h->m1, h->keys,
+	         gba->timing.masterCycles & 1023, gba->cpu->cycles, gba->cpu->nextEvent, gba->cpu->halted, gba->video.vcount);
 }
 
 static void _traceStateHash(struct GBASIONetLink* link, const char* tag) {
@@ -913,6 +981,7 @@ static void _takeSnapshot(struct GBASIONetLink* link) {
 	gba->memory.io[REG_RCNT >> 1] = link->sio->rcnt;
 	link->snapSend = gba->memory.io[REG_SIOMLT_SEND >> 1];
 	link->snapCycles = mTimingCurrentTime(&gba->timing);
+	link->snapMaster = gba->timing.masterCycles;
 	GBASerialize(gba, link->snapshot);
 	/* Flash/SRAM contents are not in the state; a frame that saves must be replayable too. */
 	struct GBASavedata* sd = &gba->memory.savedata;
@@ -961,10 +1030,11 @@ static bool _restoreSnapshot(struct GBASIONetLink* link, struct mTiming* timing)
 	}
 	_applyStatusBits(link);
 	if (!mTimingIsScheduled(timing, &link->event)) {
-		mTimingSchedule(timing, &link->event, POLL_PERIOD);
+		mTimingSchedule(timing, &link->event, _latticeWait(mTimingCurrentTime(timing)));
 	}
 	link->lastTickAt = mTimingCurrentTime(timing);
 	link->snapCycles = link->lastTickAt; /* the rebased clock now reads the snapshot instant */
+	link->snapMaster = timing->masterCycles;
 	_traceStateHash(link, "rest");
 	if (!ok) {
 		NL_LOG("Snapshot restore failed; fast link disabled");
@@ -1001,6 +1071,10 @@ static void _deinit(struct GBASIODriver* driver) {
 	link->snapshot = NULL;
 	free(link->saveSnapshot);
 	link->saveSnapshot = NULL;
+	free(link->specIwram);
+	link->specIwram = NULL;
+	free(link->specIo);
+	link->specIo = NULL;
 	link->saveSnapshotSize = 0;
 	if (link->sio && mTimingIsScheduled(&link->sio->p->timing, &link->event)) {
 		mTimingDeschedule(&link->sio->p->timing, &link->event);
@@ -1068,7 +1142,7 @@ static bool _load(struct GBASIODriver* driver) {
 		_sendTo(link, link->peers[0].fd, &mode);
 	}
 	if (!mTimingIsScheduled(&link->sio->p->timing, &link->event)) {
-		mTimingSchedule(&link->sio->p->timing, &link->event, POLL_PERIOD);
+		mTimingSchedule(&link->sio->p->timing, &link->event, _latticeWait(mTimingCurrentTime(&link->sio->p->timing)));
 	}
 	NL_LOG("Multiplayer mode entered (player %d)", link->id + 1);
 	NL_TRACE("%c load frame=%u siocnt=%04x rcnt=%04x", link->host ? 'M' : 'C', link->sio->p->video.frameCounter, link->sio->siocnt, link->sio->rcnt);
@@ -1189,14 +1263,24 @@ static uint16_t _writeRegister(struct GBASIODriver* driver, uint32_t address, ui
 		link->activeIdx = link->frameIdx;
 		link->activeFrame = sio->p->video.frameCounter;
 		++link->frameIdx;
-		if (link->fastActive && !link->exactThisFrame && link->snapshotValid && sio->p->video.frameCounter == link->snapFrame) {
+		if ((link->fastPhase == FAST_SPEC && link->specFrozen) || link->abortFlag) {
+			/* A restore is pending (waiting for a prescaler boundary): whatever the game
+			 * does now is discarded, so never let it reach the network. */
+			link->recv[1] = 0;
+			link->localTransfer = true;
+			link->gotMask = 0x0F;
+		} else if (link->fastActive && !link->exactThisFrame && link->snapshotValid && sio->p->video.frameCounter == link->snapFrame) {
 			if (link->fastPhase == FAST_IDLE) {
 				/* First transfer after a snapshot: start a speculation segment. Audio
 				 * sampling is suspended so the speculative run does not emit sound. */
 				link->fastPhase = FAST_SPEC;
 				link->specCount = 0;
 				link->specOverflow = false;
-				mTimingDeschedule(&sio->p->timing, &sio->p->audio.sampleEvent);
+				/* The audio sample event keeps running (removing it changes when the CPU
+				 * stops between instructions, which shifts IRQ timing); the speculative
+				 * samples are dropped on restore, and the frontend is asked not to block
+				 * on audio meanwhile. */
+				_nudge(link);
 				NL_TRACE("M spec begin frame=%u idx=%d cyc=%u", sio->p->video.frameCounter, link->activeIdx, mTimingCurrentTime(&sio->p->timing) - link->snapCycles);
 			}
 			if (link->fastPhase == FAST_SPEC) {
@@ -1250,6 +1334,10 @@ static uint16_t _writeRegister(struct GBASIODriver* driver, uint32_t address, ui
 static void _hostRestore(struct GBASIONetLink* link, struct mTiming* timing) {
 	struct GBA* gba = link->sio->p;
 	_restoreSnapshot(link, timing);
+	/* Discard the audio produced by the speculative pass. */
+	blip_clear(gba->audio.psg.left);
+	blip_clear(gba->audio.psg.right);
+	_unnudge(link);
 	link->transferActive = false;
 	link->localTransfer = false;
 	link->abortFlag = false;
@@ -1295,6 +1383,21 @@ static void _hostAbortBlock(struct GBASIONetLink* link, struct mTiming* timing, 
 	link->exactThisFrame = true;
 }
 
+/* Debug: remember the state at the end of the speculative pass (taken at the boundary tick). */
+static void _captureSpecEnd(struct GBASIONetLink* link) {
+	struct GBA* gba = link->sio->p;
+	struct NetLinkHash h;
+	_computeHashRel(link, &h, link->specRel, &link->specRelN);
+	memcpy(link->specHash, &h, sizeof(h) < sizeof(link->specHash) ? sizeof(h) : sizeof(link->specHash));
+	link->specHashValid = true;
+	if (!link->specIwram) {
+		link->specIwram = malloc(0x8000);
+		link->specIo = malloc(0x400);
+	}
+	memcpy(link->specIwram, gba->memory.iwram, 0x8000);
+	memcpy(link->specIo, gba->memory.io, 0x400);
+}
+
 static void _hostFrameBoundary(struct GBASIONetLink* link, struct mTiming* timing) {
 	struct GBA* gba = link->sio->p;
 	bool wantFast = link->fastEnabled && link->attached == 2 && link->snapshot && link->consecutiveAborts < FAST_MAX_ABORTS && link->selfMulti;
@@ -1303,12 +1406,6 @@ static void _hostFrameBoundary(struct GBASIONetLink* link, struct mTiming* timin
 		/* Speculative frame done: back to the frame start and exchange words. */
 		int k = link->specCount;
 		bool overflow = link->specOverflow;
-		if (_traceOn()) {
-			struct NetLinkHash h;
-			_computeHash(link, &h);
-			memcpy(link->specHash, &h, sizeof(h) < sizeof(link->specHash) ? sizeof(h) : sizeof(link->specHash));
-			link->specHashValid = true;
-		}
 		_hostRestore(link, timing);
 		if (overflow || k == 0) {
 			link->fastPhase = FAST_IDLE;
@@ -1379,6 +1476,32 @@ static void _hostFrameBoundary(struct GBASIONetLink* link, struct mTiming* timin
 			if (memcmp(&h, &sh, sizeof(h))) {
 				_printHash(link, "spec-end", &sh);
 				_printHash(link, "real-end", &h);
+				int32_t rel[24];
+				int n = 0;
+				_computeHashRel(link, &h, rel, &n);
+				int i;
+				for (i = 0; i < n && i < link->specRelN; ++i) {
+					if (rel[i] != link->specRel[i]) {
+						NL_TRACE("M timdiff idx=%d spec=%d real=%d", i, link->specRel[i], rel[i]);
+					}
+				}
+				int shown = 0;
+				const uint32_t* a = (const uint32_t*) link->specIwram;
+				const uint32_t* b = (const uint32_t*) gba->memory.iwram;
+				for (i = 0; i < 0x2000 && shown < 12; ++i) {
+					if (a[i] != b[i]) {
+						NL_TRACE("M iwdiff off=%05x spec=%08x real=%08x", i * 4, a[i], b[i]);
+						++shown;
+					}
+				}
+				const uint16_t* ia = (const uint16_t*) link->specIo;
+				const uint16_t* ib = (const uint16_t*) gba->memory.io;
+				for (i = 0, shown = 0; i < 0x200 && shown < 8; ++i) {
+					if (ia[i] != ib[i]) {
+						NL_TRACE("M iodiff reg=%03x spec=%04x real=%04x", i * 2, ia[i], ib[i]);
+						++shown;
+					}
+				}
 			}
 			link->specHashValid = false;
 		}
@@ -1386,6 +1509,9 @@ static void _hostFrameBoundary(struct GBASIONetLink* link, struct mTiming* timin
 		/* fall through: take the snapshot for the next frame */
 		// fall through
 	default:
+		if ((gba->video.frameCounter & 127) == 0) {
+			s_trace = -1; /* re-read NETLINK_TRACE / debug.cartucho.nltrace while running */
+		}
 		link->reportFrame = gba->video.frameCounter;
 		memcpy(link->prevFrameChild, link->curFrameChild, sizeof(link->prevFrameChild));
 		link->prevFrameCount = link->curFrameCount;
@@ -1421,6 +1547,31 @@ static void _childApplyDone(struct GBASIONetLink* link, struct mTiming* timing, 
 	}
 }
 
+static bool _childDeferredRestore(struct GBASIONetLink* link, struct mTiming* timing, int32_t* nextTickIn) {
+	if (!link->childRestorePending) {
+		return false;
+	}
+	int32_t wait = _restoreWait(timing, link->snapMaster);
+	if (wait > 0 && link->restoreTries < RESTORE_MAX_TRIES) {
+		++link->restoreTries;
+		*nextTickIn = _scheduleDelay(timing, wait);
+		return true;
+	}
+	link->restoreTries = 0;
+	_restoreSnapshot(link, timing);
+	link->childSnapshotValid = false;
+	link->blockActive = false;
+	link->reqPending = false;
+	/* Back to exactly the reply-gating state the game was in at the snapshot: the
+	 * next answer must wait for the game to load SIOMLT_SEND, as it would have. */
+	link->sendWrittenSinceDone = link->snapSendWritten;
+	link->haveDone = link->snapHaveDone;
+	link->lastDoneAt = mTimingCurrentTime(timing) - link->snapSinceDone;
+	link->childRestorePending = false;
+	NL_TRACE("C block %u aborted: restored", link->childRestoreSeq);
+	return false;
+}
+
 static void _childApplyEvents(struct GBASIONetLink* link, struct mTiming* timing, struct GBASIO* sio, struct GBA* gba) {
 	struct NetLinkMsg ev;
 	while (_pop(link, &ev)) {
@@ -1438,6 +1589,9 @@ static void _childApplyEvents(struct GBASIONetLink* link, struct mTiming* timing
 		case EV_BLOCK_START:
 			if (link->snapshot && !link->blockActive && ev.seq == link->blockReqSeq) {
 				_takeSnapshot(link);
+				link->snapSendWritten = link->sendWrittenSinceDone;
+				link->snapHaveDone = link->haveDone;
+				link->snapSinceDone = link->haveDone ? (int32_t) (mTimingCurrentTime(timing) - link->lastDoneAt) : 0;
 				link->childSnapshotValid = true;
 				link->blockActive = true;
 				link->blockIndex = 0;
@@ -1448,13 +1602,10 @@ static void _childApplyEvents(struct GBASIONetLink* link, struct mTiming* timing
 			break;
 		case EV_BLOCK_ABORT:
 			if (link->childSnapshotValid && ev.seq == link->blockReqSeq) {
-				_restoreSnapshot(link, timing);
-				link->childSnapshotValid = false;
-				link->blockActive = false;
-				link->reqPending = false;
-				link->sendWrittenSinceDone = true;
-				link->lastDoneAt = mTimingCurrentTime(timing);
-				NL_TRACE("C block %u aborted: restored", ev.seq);
+				/* Restore on a prescaler boundary; later events stay queued until then. */
+				link->childRestorePending = true;
+				link->childRestoreSeq = ev.seq;
+				return;
 			}
 			break;
 		default:
@@ -1525,8 +1676,24 @@ static void _tick(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 		elapsed = POLL_PERIOD + cyclesLate;
 	}
 	link->lastTickAt = nowCycles;
+	_debugTick(link, nowCycles);
+	int32_t childTickIn = _latticeWait(nowCycles);
 	if (!link->host) {
+		if (_childDeferredRestore(link, timing, &childTickIn)) {
+			pthread_mutex_unlock(&link->lock);
+			if (!mTimingIsScheduled(timing, &link->event)) {
+				mTimingSchedule(timing, &link->event, childTickIn);
+			}
+			return;
+		}
 		_childApplyEvents(link, timing, sio, gba);
+		if (link->childRestorePending && _childDeferredRestore(link, timing, &childTickIn)) {
+			pthread_mutex_unlock(&link->lock);
+			if (!mTimingIsScheduled(timing, &link->event)) {
+				mTimingSchedule(timing, &link->event, childTickIn);
+			}
+			return;
+		}
 	}
 	while (link->host && _pop(link, &ev)) {
 		switch (ev.type) {
@@ -1587,16 +1754,47 @@ static void _tick(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 			}
 			pthread_cond_timedwait(&link->respCond, &link->lock, &ts);
 			_childApplyEvents(link, timing, sio, gba);
+			if (link->childRestorePending) {
+				break;
+			}
 			_childReply(link, timing);
 		}
 		_unnudge(link);
 	}
 
+	int32_t nextTickIn = _latticeWait(nowCycles);
 	if (link->host) {
 		uint32_t frame = gba->video.frameCounter;
 		if (frame != link->lastFrameSeen) {
 			link->lastFrameSeen = frame;
-			_hostFrameBoundary(link, timing);
+			link->boundaryPending = true;
+			if (link->fastPhase == FAST_SPEC && _traceOn()) {
+				_captureSpecEnd(link);
+			}
+		}
+		if (link->boundaryPending || link->abortFlag) {
+			bool needRestore = link->abortFlag || (link->boundaryPending && link->fastPhase == FAST_SPEC);
+			int32_t wait = (needRestore && link->snapshotValid) ? _restoreWait(timing, link->snapMaster) : 0;
+			if (wait > 0 && link->restoreTries < RESTORE_MAX_TRIES) {
+				/* Not on a prescaler boundary yet (the CPU overshot the tick): keep running,
+				 * results are discarded, and try again at the next aligned instant. */
+				link->specFrozen = true;
+				++link->restoreTries;
+				nextTickIn = _scheduleDelay(timing, wait);
+			} else {
+				if (wait > 0) {
+					NL_TRACE("M restore forced off-phase by %d cycles", RESTORE_ALIGN - wait);
+				}
+				link->restoreTries = 0;
+				if (link->boundaryPending) {
+					link->boundaryPending = false;
+					_hostFrameBoundary(link, timing);
+				}
+				if (link->abortFlag) {
+					_hostAbortBlock(link, timing, "word mismatch");
+				}
+				link->specFrozen = false;
+			}
 		}
 		if (link->fastPhase == FAST_IDLE && !link->snapshotValid) {
 			link->reportFrame = gba->video.frameCounter;
@@ -1606,9 +1804,6 @@ static void _tick(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 				link->pendingKeys = gba->keysActive;
 				gba->keysActive = link->frozenKeys;
 			}
-		}
-		if (link->abortFlag) {
-			_hostAbortBlock(link, timing, "word mismatch");
 		}
 	}
 
@@ -1671,7 +1866,7 @@ static void _tick(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	pthread_mutex_unlock(&link->lock);
 
 	if (!mTimingIsScheduled(timing, &link->event)) {
-		mTimingSchedule(timing, &link->event, POLL_PERIOD - cyclesLate);
+		mTimingSchedule(timing, &link->event, nextTickIn);
 	}
 }
 
