@@ -1276,10 +1276,9 @@ static uint16_t _writeRegister(struct GBASIODriver* driver, uint32_t address, ui
 				link->fastPhase = FAST_SPEC;
 				link->specCount = 0;
 				link->specOverflow = false;
-				/* The audio sample event keeps running (removing it changes when the CPU
-				 * stops between instructions, which shifts IRQ timing); the speculative
-				 * samples are dropped on restore, and the frontend is asked not to block
-				 * on audio meanwhile. */
+				/* No audio during the speculative pass: the sample event is removed (the
+				 * restore brings it back) and the frontend is asked not to block on audio. */
+				mTimingDeschedule(&sio->p->timing, &sio->p->audio.sampleEvent);
 				_nudge(link);
 				NL_TRACE("M spec begin frame=%u idx=%d cyc=%u", sio->p->video.frameCounter, link->activeIdx, mTimingCurrentTime(&sio->p->timing) - link->snapCycles);
 			}
@@ -1334,9 +1333,6 @@ static uint16_t _writeRegister(struct GBASIODriver* driver, uint32_t address, ui
 static void _hostRestore(struct GBASIONetLink* link, struct mTiming* timing) {
 	struct GBA* gba = link->sio->p;
 	_restoreSnapshot(link, timing);
-	/* Discard the audio produced by the speculative pass. */
-	blip_clear(gba->audio.psg.left);
-	blip_clear(gba->audio.psg.right);
 	_unnudge(link);
 	link->transferActive = false;
 	link->localTransfer = false;
