@@ -77,8 +77,8 @@ void NetLinkView::host() {
 		QMessageBox::warning(this, tr("Network link cable"), tr("Load a Game Boy Advance game first."));
 		return;
 	}
-	if (!m_controller->hostNetLink(m_ui.port->value())) {
-		QMessageBox::warning(this, tr("Network link cable"), tr("Could not open port %1.").arg(m_ui.port->value()));
+	if (!m_controller->hostNetLink(m_ui.hostPort->value())) {
+		QMessageBox::warning(this, tr("Network link cable"), tr("Could not open port %1.").arg(m_ui.hostPort->value()));
 	}
 	updateStatus();
 }
@@ -141,6 +141,7 @@ void NetLinkView::updateStatus() {
 	m_ui.host->setDisabled(active);
 	m_ui.join->setDisabled(active);
 	m_ui.port->setDisabled(active);
+	m_ui.hostPort->setDisabled(active);
 	m_ui.address->setDisabled(active);
 	m_ui.disconnect->setEnabled(active);
 }
