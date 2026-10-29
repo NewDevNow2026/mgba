@@ -1509,6 +1509,10 @@ static void _hostFrameBoundary(struct GBASIONetLink* link, struct mTiming* timin
 		if ((gba->video.frameCounter & 127) == 0) {
 			s_trace = -1; /* re-read NETLINK_TRACE / debug.cartucho.nltrace while running */
 		}
+		if (link->consecutiveAborts >= FAST_MAX_ABORTS && (gba->video.frameCounter % 300) == 0) {
+			/* Disabled after repeated aborts (e.g. the partner was paused): try again every 5 s. */
+			link->consecutiveAborts = FAST_MAX_ABORTS - 1;
+		}
 		link->reportFrame = gba->video.frameCounter;
 		memcpy(link->prevFrameChild, link->curFrameChild, sizeof(link->prevFrameChild));
 		link->prevFrameCount = link->curFrameCount;
